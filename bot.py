@@ -1302,13 +1302,11 @@ async def close_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ============================================================
-# STAFF COMMAND — /stats (with ad performance section)
+# SHARED TEXT HELPERS — used by both commands and dashboard buttons
 # ============================================================
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
-        return
-
+async def _stats_text() -> str:
+    """Generate stats text. Shared by /stats command and dashboard button."""
     def q(cur):
         cur.execute(f"SELECT COUNT(*) AS c FROM {USERS_TABLE}")
         total = cur.fetchone()["c"]
@@ -1335,7 +1333,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             result[column] = cur.fetchall()
 
-        # Top campaigns by starts
         cur.execute(f"""
             SELECT campaign_token, COUNT(*) AS c
             FROM {EVENTS_TABLE}
@@ -1346,7 +1343,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """)
         result["top_campaigns"] = cur.fetchall()
 
-        # Conversion funnel (last 30 days)
         cur.execute(f"""
             SELECT event_name, COUNT(DISTINCT user_id) AS c
             FROM {EVENTS_TABLE}
@@ -1374,7 +1370,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for row in data["top_campaigns"]
     ) or "  No campaign data yet."
 
-    await update.message.reply_text(
+    return (
         f"📊 {BRAND.upper()} STATISTICS\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👥 Total Customers   : {total}\n"
@@ -1404,6 +1400,104 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{rows(data['bonus'], 'bonus')}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━"
     )
+
+
+async def _adstats_overview_text() -> str:
+    """Generate adstats overview text. Shared by /adstats command and dashboard button."""
+    def q(cur):
+        cur.execute(f"""
+            SELECT
+                c.token, c.platform, c.campaign_name,
+                c.expected_clicks, c.actual_clicks,
+                COUNT(DISTINCT CASE WHEN e.event_name = 'bot_start' THEN e.user_id END) AS starts,
+                COUNT(DISTINCT CASE WHEN e.event_name = 'bonus_selected' THEN e.user_id END) AS bonus,
+                COUNT(DISTINCT CASE WHEN e.event_name = 'game_selected' THEN e.user_id END) AS game,
+                COUNT(DISTINCT CASE WHEN e.event_name = 'first_message' THEN e.user_id END) AS msgs,
+                COUNT(DISTINCT CASE WHEN e.event_name = 'nudge_sent' THEN e.user_id END) AS nudges
+            FROM {CAMPAIGNS_TABLE} c
+            LEFT JOIN {EVENTS_TABLE} e ON e.campaign_token = c.token
+            GROUP BY c.token, c.platform, c.campaign_name,
+                     c.expected_clicks, c.actual_clicks
+            ORDER BY starts DESC
+        """)
+        return cur.fetchall()
+
+    rows_data = await asyncio.to_thread(_run, q)
+    if not rows_data:
+        return "📭 No campaigns registered yet.\n\nUse /menu → 📣 Campaigns → ➕ Add New Campaign"
+
+    lines = []
+    for r in rows_data:
+        actual = r["actual_clicks"] or 0
+        expected = r["expected_clicks"] or 0
+        starts = r["starts"]
+        ctr = f"{(starts / actual * 100):.1f}%" if actual else "—"
+        conv = f"{(r['msgs'] / starts * 100):.1f}%" if starts else "—"
+        lines.append(
+            f"🎯 `{r['token']}` ({r['platform']})\n"
+            f"   {r['campaign_name']}\n"
+            f"   Clicks: {actual}/{expected} exp | Starts: {starts} | CTR: {ctr}\n"
+            f"   Bonus: {r['bonus']} | Game: {r['game']} | Msgs: {r['msgs']}\n"
+            f"   ➡️ Start→Msg: {conv} | Nudges: {r['nudges']}"
+        )
+    return (
+        f"📈 {BRAND.upper()} AD PERFORMANCE OVERVIEW\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n\n".join(lines) + "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 Use /adstats <token> for per-campaign detail."
+    )
+
+
+async def _campaigns_list_text() -> str:
+    """Generate campaigns list text. Shared by /campaigns command and dashboard button."""
+    all_campaigns = await db_list_campaigns(active_only=False)
+    if not all_campaigns:
+        return (
+            "📭 No campaigns registered yet.\n\n"
+            "Use /menu → 📣 Campaigns → ➕ Add New Campaign"
+        )
+    lines = []
+    for c in all_campaigns:
+        status = "🟢" if c["is_active"] else "🔴"
+        lines.append(
+            f"{status} `{c['token']}`\n"
+            f"   Platform : {c['platform']}\n"
+            f"   Name     : {c['campaign_name']}\n"
+            f"   Creative : {c['creative'] or '—'}\n"
+            f"   Target   : {c['target_channel'] or '—'}\n"
+            f"   Clicks   : {c['actual_clicks'] or '—'} / {c['expected_clicks'] or '—'} expected\n"
+            f"   Started  : {c['started_at'].strftime('%Y-%m-%d')}"
+            + (f"\n   Ended    : {c['ended_at'].strftime('%Y-%m-%d')}" if c["ended_at"] else "")
+        )
+    return (
+        f"📣 {BRAND.upper()} CAMPAIGN REGISTRY\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(lines) + "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+async def _staff_text() -> str:
+    """Generate staff list text."""
+    ids = "\n".join(f"  {item}" for item in sorted(AUTHORIZED_STAFF)) or "  (none)"
+    return (
+        f"👥 AUTHORIZED STAFF\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{ids}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+# ============================================================
+# STAFF COMMAND — /stats (with ad performance section)
+# ============================================================
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_staff(update):
+        return
+    text = await _stats_text()
+    await update.message.reply_text(text)
 
 
 # ============================================================
@@ -1489,13 +1583,8 @@ async def remove_staff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def staff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_staff(update):
         return
-    ids = "\n".join(f"  {item}" for item in sorted(AUTHORIZED_STAFF)) or "  (none)"
-    await update.message.reply_text(
-        f"👥 AUTHORIZED STAFF\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{ids}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
+    text = await _staff_text()
+    await update.message.reply_text(text)
 
 
 # ============================================================
@@ -1516,36 +1605,9 @@ async def campaigns_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     args = context.args or []
     if not args:
-        # List all campaigns
-        all_campaigns = await db_list_campaigns(active_only=False)
-        if not all_campaigns:
-            await update.message.reply_text(
-                "📭 No campaigns registered yet.\n\n"
-                "Add one with:\n"
-                "/campaigns add tgads_v1 telegram_ads 'September Test' "
-                "'$5 free play' 'fish-game-channels' 500"
-            )
-            return
-
-        lines = []
-        for c in all_campaigns:
-            status = "🟢" if c["is_active"] else "🔴"
-            lines.append(
-                f"{status} `{c['token']}`\n"
-                f"   Platform : {c['platform']}\n"
-                f"   Name     : {c['campaign_name']}\n"
-                f"   Creative : {c['creative'] or '—'}\n"
-                f"   Target   : {c['target_channel'] or '—'}\n"
-                f"   Clicks   : {c['actual_clicks'] or '—'} / {c['expected_clicks'] or '—'} expected\n"
-                f"   Started  : {c['started_at'].strftime('%Y-%m-%d')}"
-                + (f"\n   Ended    : {c['ended_at'].strftime('%Y-%m-%d')}" if c["ended_at"] else "")
-            )
-        await update.message.reply_text(
-            f"📣 {BRAND.upper()} CAMPAIGN REGISTRY\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            + "\n".join(lines) + "\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━",
-        )
+        # List all campaigns (use shared helper)
+        text = await _campaigns_list_text()
+        await update.message.reply_text(text)
         return
 
     action = args[0].lower()
@@ -1623,56 +1685,9 @@ async def adstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     args = context.args or []
 
     if not args:
-        # Overview: all campaigns with funnel
-        def q(cur):
-            cur.execute(f"""
-                SELECT
-                    c.token,
-                    c.platform,
-                    c.campaign_name,
-                    c.expected_clicks,
-                    c.actual_clicks,
-                    COUNT(DISTINCT CASE WHEN e.event_name = 'bot_start' THEN e.user_id END) AS starts,
-                    COUNT(DISTINCT CASE WHEN e.event_name = 'bonus_selected' THEN e.user_id END) AS bonus,
-                    COUNT(DISTINCT CASE WHEN e.event_name = 'game_selected' THEN e.user_id END) AS game,
-                    COUNT(DISTINCT CASE WHEN e.event_name = 'first_message' THEN e.user_id END) AS msgs,
-                    COUNT(DISTINCT CASE WHEN e.event_name = 'nudge_sent' THEN e.user_id END) AS nudges
-                FROM {CAMPAIGNS_TABLE} c
-                LEFT JOIN {EVENTS_TABLE} e ON e.campaign_token = c.token
-                GROUP BY c.token, c.platform, c.campaign_name,
-                         c.expected_clicks, c.actual_clicks
-                ORDER BY starts DESC
-            """)
-            return cur.fetchall()
-
-        rows_data = await asyncio.to_thread(_run, q)
-
-        if not rows_data:
-            await update.message.reply_text("📭 No campaigns registered yet. Use /campaigns add ...")
-            return
-
-        lines = []
-        for r in rows_data:
-            actual = r["actual_clicks"] or 0
-            expected = r["expected_clicks"] or 0
-            starts = r["starts"]
-            ctr = f"{(starts / actual * 100):.1f}%" if actual else "—"
-            conv = f"{(r['msgs'] / starts * 100):.1f}%" if starts else "—"
-            lines.append(
-                f"🎯 `{r['token']}` ({r['platform']})\n"
-                f"   {r['campaign_name']}\n"
-                f"   Clicks: {actual}/{expected} exp | Starts: {starts} | CTR: {ctr}\n"
-                f"   Bonus: {r['bonus']} | Game: {r['game']} | Msgs: {r['msgs']}\n"
-                f"   ➡️ Start→Msg: {conv} | Nudges: {r['nudges']}"
-            )
-
-        await update.message.reply_text(
-            f"📈 {BRAND.upper()} AD PERFORMANCE OVERVIEW\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            + "\n\n".join(lines) + "\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "💡 Use /adstats <token> for per-campaign detail."
-        )
+        # Overview: all campaigns with funnel (use shared helper)
+        text = await _adstats_overview_text()
+        await update.message.reply_text(text)
         return
 
     # Detail view for one campaign
@@ -1757,6 +1772,176 @@ async def adstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ============================================================
+# STAFF DASHBOARD — Button-based interface (no commands needed)
+# ============================================================
+
+def dashboard_text() -> str:
+    """Main dashboard header text."""
+    return (
+        f"🎛️ {BRAND.upper()} STAFF DASHBOARD\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Tap a button below 👇"
+    )
+
+
+def dashboard_keyboard() -> InlineKeyboardMarkup:
+    """Main dashboard keyboard — 6 primary actions."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Bot Statistics", callback_data="menu:stats")],
+        [InlineKeyboardButton("📈 Ad Performance", callback_data="menu:adstats")],
+        [InlineKeyboardButton("📣 Campaigns", callback_data="menu:campaigns")],
+        [InlineKeyboardButton("👥 Staff List", callback_data="menu:staff")],
+        [InlineKeyboardButton("📢 Broadcast Hint", callback_data="menu:broadcast")],
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="menu:refresh"),
+            InlineKeyboardButton("❌ Close", callback_data="menu:close"),
+        ],
+    ])
+
+
+def campaigns_menu_keyboard() -> InlineKeyboardMarkup:
+    """Sub-menu for campaign actions."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 List All Campaigns", callback_data="menu:campaigns_list")],
+        [InlineKeyboardButton("➕ Add New Campaign", callback_data="menu:campaigns_add")],
+        [InlineKeyboardButton("🔴 End Campaign", callback_data="menu:campaigns_end")],
+        [InlineKeyboardButton("🔢 Update Clicks", callback_data="menu:campaigns_clicks")],
+        [InlineKeyboardButton("🔙 Back to Dashboard", callback_data="menu:back")],
+    ])
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open the staff dashboard with buttons."""
+    if not await require_staff(update):
+        return
+    await update.message.reply_text(dashboard_text(), reply_markup=dashboard_keyboard())
+
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle dashboard button clicks. Edits the dashboard message in-place."""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    # Security: only staff can use dashboard, only in support group
+    if not query.from_user or query.from_user.id not in AUTHORIZED_STAFF:
+        return
+    if query.message.chat.id != SUPPORT_GROUP_ID:
+        return
+
+    action = query.data.replace("menu:", "", 1)
+
+    try:
+        if action == "stats":
+            text = await _stats_text()
+            await query.message.edit_text(
+                text + "\n\n" + dashboard_text(),
+                reply_markup=dashboard_keyboard()
+            )
+
+        elif action == "adstats":
+            text = await _adstats_overview_text()
+            await query.message.edit_text(
+                text + "\n\n" + dashboard_text(),
+                reply_markup=dashboard_keyboard()
+            )
+
+        elif action == "campaigns":
+            await query.message.edit_text(
+                "📣 CAMPAIGNS MENU\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Select an action:",
+                reply_markup=campaigns_menu_keyboard()
+            )
+
+        elif action == "campaigns_list":
+            text = await _campaigns_list_text()
+            await query.message.edit_text(
+                text + "\n\n" + dashboard_text(),
+                reply_markup=dashboard_keyboard()
+            )
+
+        elif action == "campaigns_add":
+            await query.message.edit_text(
+                "➕ ADD NEW CAMPAIGN\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Copy this command, fill in your details, and send it in this group:\n\n"
+                "<code>/campaigns add &lt;token&gt; &lt;platform&gt; \"&lt;name&gt;\" "
+                "\"&lt;creative&gt;\" \"&lt;target&gt;\" &lt;expected_clicks&gt;</code>\n\n"
+                "Example:\n"
+                "<code>/campaigns add tgads_v1 telegram_ads \"September Test\" "
+                "\"$5 free play\" \"fish-game-channels\" 500</code>\n\n"
+                "After registering, the bot will reply with your ad destination URL.",
+                reply_markup=dashboard_keyboard(),
+                parse_mode="HTML"
+            )
+
+        elif action == "campaigns_end":
+            await query.message.edit_text(
+                "🔴 END CAMPAIGN\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Copy this command and send:\n\n"
+                "<code>/campaigns end &lt;token&gt;</code>\n\n"
+                "Example:\n"
+                "<code>/campaigns end tgads_v1</code>",
+                reply_markup=dashboard_keyboard(),
+                parse_mode="HTML"
+            )
+
+        elif action == "campaigns_clicks":
+            await query.message.edit_text(
+                "🔢 UPDATE CAMPAIGN CLICKS\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Get the clicks count from your Telegram Ads dashboard, then send:\n\n"
+                "<code>/campaigns clicks &lt;token&gt; &lt;count&gt;</code>\n\n"
+                "Example:\n"
+                "<code>/campaigns clicks tgads_v1 269</code>",
+                reply_markup=dashboard_keyboard(),
+                parse_mode="HTML"
+            )
+
+        elif action == "staff":
+            text = await _staff_text()
+            await query.message.edit_text(
+                text + "\n\n" + dashboard_text(),
+                reply_markup=dashboard_keyboard()
+            )
+
+        elif action == "broadcast":
+            await query.message.edit_text(
+                "📢 BROADCAST\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Copy this command and send:\n\n"
+                "<code>/broadcast &lt;message&gt;</code>\n\n"
+                "Use <code>{name}</code> to personalize:\n"
+                "<code>/broadcast Hi {name}, new game added! 🎮</code>",
+                reply_markup=dashboard_keyboard(),
+                parse_mode="HTML"
+            )
+
+        elif action == "refresh":
+            await query.message.edit_text(dashboard_text(), reply_markup=dashboard_keyboard())
+
+        elif action == "back":
+            await query.message.edit_text(dashboard_text(), reply_markup=dashboard_keyboard())
+
+        elif action == "close":
+            try:
+                await query.message.delete()
+            except TelegramError:
+                # If delete fails (e.g., no permission), edit to a minimal message
+                try:
+                    await query.message.edit_text(" Dashboard closed. Type /menu to reopen.")
+                except TelegramError:
+                    pass
+
+    except TelegramError as e:
+        # Edit can fail if message content is identical (e.g., clicking Refresh twice)
+        logger.warning("Menu edit failed: %s", e)
+
+
+# ============================================================
 # ERROR HANDLER + POST-INIT + MAIN
 # ============================================================
 
@@ -1776,6 +1961,7 @@ async def post_init(application: Application) -> None:
 
     # Staff-only command menu (visible only inside support group)
     group_commands = public + [
+        BotCommand("menu", "Open staff dashboard (buttons)"),
         BotCommand("id", "Show customer info for this topic"),
         BotCommand("close", "Close this customer topic"),
         BotCommand("stats", "Show bot statistics"),
@@ -1857,12 +2043,14 @@ def main() -> None:
     # Callback handlers (inline button clicks)
     application.add_handler(CallbackQueryHandler(bonus_selected, pattern=r"^bonus:"))
     application.add_handler(CallbackQueryHandler(game_selected, pattern=r"^game:"))
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
 
     # Setup helper
     application.add_handler(CommandHandler("groupid", group_id_command))
 
     # Staff commands (group-only)
     group_filter = filters.Chat(chat_id=SUPPORT_GROUP_ID)
+    application.add_handler(CommandHandler("menu", menu_command, filters=group_filter))
     application.add_handler(CommandHandler("id", customer_info, filters=group_filter))
     application.add_handler(CommandHandler("close", close_topic, filters=group_filter))
     application.add_handler(CommandHandler("stats", stats, filters=group_filter))
