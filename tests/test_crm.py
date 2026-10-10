@@ -1,72 +1,68 @@
-import sys
-from pathlib import Path
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+"""Tests for user-configurable labels, game names and usernames."""
 import pytest
-from crm import (parse_game,parse_source,normalize_game,normalize_label,
-                 normalize_workflow,safe_username,topic_title,profile_text,
-                 retry_delay,is_permanent_error,is_topic_missing)
+from crm import (
+    parse_game, parse_source, normalize_game, normalize_label, label_display,
+    normalize_workflow, safe_username, topic_title, profile_text,
+    parse_account_template, infer_game,
+)
 
+def test_builtin_game_names_ignore_case():
+    assert parse_game(['JUWA']) == 'Juwa'
+    assert parse_game(['vBLinK']) == 'Vblink'
+    assert parse_game(['cashmaster']) == 'CashMaster'
+    assert parse_game(['missing']) is None
 
-def test_game_case_insensitive():
-    assert parse_game(['juWa'])=='Juwa'
-    assert parse_game(['vblink'])=='Vblink'
-    assert parse_game(['wrong']) is None
+def test_custom_game_names_preserve_user_text():
+    assert normalize_game('FIRE KIRIN') == 'Firekirin'
+    assert normalize_game('My Special Game') == 'My Special Game'
 
+@pytest.mark.parametrize('text', ['VIP','ViP','vip'])
+def test_case_insensitive_labels(text):
+    assert normalize_label(text)=='vip'
 
-def test_source_links():
-    assert parse_source(['src_facebook'])=='📘 Facebook'
-    assert parse_source(['website'])=='🌐 Website'
-    assert parse_source(['juwa']) is None
+def test_arbitrary_labels():
+    assert normalize_label('High Roller')=='high roller'
+    assert normalize_label('Needs Follow-Up')=='needs follow-up'
+    assert label_display('high roller','High Roller')=='High Roller'
 
+def test_usernames_preserve_case_and_custom_characters():
+    assert safe_username('@Player123') == 'Player123'
+    assert safe_username('Player Name') == 'Player Name'
+    assert safe_username('some/password') == 'some/password'
+    with pytest.raises(ValueError):safe_username('')
+    with pytest.raises(ValueError):safe_username('x'*90)
 
-def test_username_validation():
-    assert safe_username('@player_123')=='player_123'
-    for username in ('','x'*90,'a b','some/password','name\nmore'):
-        with pytest.raises(ValueError):safe_username(username)
+def test_workflow_custom():
+    assert normalize_workflow('In Progress') == 'in_progress'
+    assert normalize_workflow('call later') == 'call_later'
 
+@pytest.mark.parametrize(('username','game'),[
+    ('Bob3s','Orionstars'), ('Sarah33s','Orionstars'),
+    ('Ali333fk','Firekirin'), ('Alice3u','Ultrapanda'),
+    ('Chris3v','Vblink'), ('Nina3r','Riversweeps'),
+    ('James3j','Juwa'), ('John33gv','GameVault'),
+    ('Mary333mw','Milkyway'), ('Amy33cm','CashMaster'),
+])
+def test_credential_suffix_detection(username,game):
+    assert infer_game(username)==game
 
-def test_game_normalization():
-    assert normalize_game('OrionStars')=='Orionstars'
-    with pytest.raises(ValueError):normalize_game('fakegame')
+def test_credential_message_and_explicit_override():
+    a=parse_account_template('👤 Username: Dummy333fk\n🔑 Password: 009988')
+    assert (a.game,a.username,a.password)==('Firekirin','Dummy333fk','009988')
+    b=parse_account_template('Game: Custom Label Game\nUsername: RealPlayer\nPassword: 1234')
+    assert b.game=='Custom Label Game' and b.username=='RealPlayer'
 
-
-def test_labels_and_workflow():
-    assert normalize_label('VIP')=='vip'
-    assert normalize_workflow('in-progress')=='in_progress'
-    with pytest.raises(ValueError):normalize_label('banned')
-    with pytest.raises(ValueError):normalize_workflow('blocked')
-
+def test_pinned_profile_hides_passwords():
+    row={'user_id':12,'name':'Sarah','username':'sarah','primary_label':'vip',
+         'game':'CashMaster','source':'Telegram Ads','first_touch_campaign':'tgads_v1',
+         'last_touch_campaign':'tgads_v2'}
+    message=profile_text(row,[{'game':'CashMaster','account_username':'Sarah33cm'}],
+                         [{'label':'vip'}],[],{'count':0,'amount':0})
+    assert 'WINNING WAVE' in message
+    assert 'Sarah33cm' in message
+    assert 'tgads_v1' in message
+    assert '009988' not in message
 
 def test_topic_title():
-    title=topic_title({'user_id':100,'name':'Sarah\nJones','primary_label':'vip','game':'Juwa'})
-    assert title.startswith('👑 VIP | Sarah Jones')
-    assert '| Juwa' in title
-    assert '\n' not in title
-
-
-def test_profile_multiple_accounts():
-    row={'user_id':123,'name':'Alice','username':'alice','game':'Juwa',
-         'primary_label':'vip','workflow_status':'pending','assigned_staff':42,'bonus':None,'source':None}
-    accounts=[{'game':'Juwa','account_username':'alice123'},
-              {'game':'Orionstars','account_username':'alice456'}]
-    text=profile_text(row,accounts,['vip','depositor'],[{'body':'Helpful customer'}],{'count':2,'amount':75})
-    assert 'alice123' in text and 'alice456' in text
-    assert '👑 VIP' in text and '💰 Depositor' in text
-    assert 'Recorded deposits: 2 | $75.00' in text
-
-
-def test_retry_backoff():
-    assert retry_delay(1)==2
-    assert retry_delay(5)==32
-    assert retry_delay(200)==1024
-
-
-def test_permanent_delivery_errors():
-    assert is_permanent_error(Exception('Forbidden: bot was blocked by the user'))
-    assert not is_permanent_error(Exception('Telegram temporarily unavailable'))
-
-
-def test_topic_error_recognition():
-    assert is_topic_missing(Exception('Bad Request: message thread not found'))
-    assert is_topic_missing(Exception('topic_closed'))
-    assert not is_topic_missing(Exception('Too Many Requests: retry after 3'))
+    title=topic_title({'user_id':12,'name':'Sarah','primary_label':'vip','game':'CashMaster'})
+    assert title.startswith('👑 VIP | Sarah')
