@@ -17,6 +17,10 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes,
     MessageHandler, filters,
 )
+from settings import Config
+from database import Database
+from crm import is_topic_missing
+import crm_runtime as crm_addon
 
 # ============================================================
 # BRANDING — Winning Wave (Ads-Optimized Edition)
@@ -50,6 +54,7 @@ AUTHORIZED_STAFF: set[int] = {
     int(v.strip()) for v in _staff_env.split(",")
     if v.strip().lstrip("-").isdigit()
 }
+_crm_state = None  # PostgreSQL-backed roles; initialized in main()
 
 # ============================================================
 # STATIC CONFIG — Games, Sources, Bonuses
@@ -57,10 +62,12 @@ AUTHORIZED_STAFF: set[int] = {
 
 DEFAULT_GAMES = [
     "Orionstars", "Firekirin", "Ultrapanda", "Juwa", "GameVault",
-    "Riversweeps", "Milkyway", "Vblink", "Gameroom",
+    "Riversweeps", "Milkyway", "Vblink", "Gameroom", "CashMaster",
 ]
 _allowed_env = os.getenv("ALLOWED_GAMES", "").strip()
 GAMES = [g.strip() for g in _allowed_env.split(",") if g.strip()] or DEFAULT_GAMES
+if not any(g.casefold() == "cashmaster" for g in GAMES):
+    GAMES.append("CashMaster")
 
 # Legacy / direct traffic sources (for non-ad links like ?start=website)
 TRAFFIC_SOURCES = {
@@ -350,7 +357,7 @@ async def db_status(user_id: int, status: str) -> None:
 async def db_clear_topic(user_id: int, topic_id: int) -> None:
     def q(cur):
         cur.execute(
-            f"UPDATE {USERS_TABLE} SET topic_id = NULL, topic_status = 'open' "
+            f"UPDATE {USERS_TABLE} SET topic_id = NULL, topic_status = 'open', profile_message_id = NULL "
             "WHERE user_id = %s", (user_id,)
         )
         cur.execute(f"DELETE FROM {TOPICS_TABLE} WHERE topic_id = %s", (topic_id,))
@@ -501,8 +508,14 @@ def fire_and_forget(coroutine) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
+def _crm_authorized(user_id: int) -> bool:
+    if _crm_state is None:
+        return user_id in AUTHORIZED_STAFF
+    return user_id in _crm_state.cfg.owner_ids or user_id in _crm_state.roles
+
+
 def is_staff(message) -> bool:
-    return bool(message.from_user and message.from_user.id in AUTHORIZED_STAFF)
+    return bool(message.from_user and _crm_authorized(message.from_user.id))
 
 
 def user_label(user) -> str:
@@ -679,7 +692,7 @@ async def create_topic(user, context, game=None, source=None, campaign_token=Non
         topic_id = forum_topic.message_thread_id
 
         old = await db_user(user.id)
-        selected_game = old["game"] if old and old["game"] else game
+        selected_game = game or (old["game"] if old and old["game"] else None)
         saved_source = (old.get("source") if old else None) or source
 
         await db_upsert(
@@ -725,7 +738,14 @@ async def reopen_or_recreate(user, topic_id: int, context) -> int | None:
         )
         return topic_id
     except TelegramError as error:
-        logger.warning("Could not reopen topic %s: %s", topic_id, error)
+        error_message = str(error).casefold()
+        if "not closed" in error_message:
+            await db_status(user.id, "open")
+            return topic_id
+        if not is_topic_missing(error) or "closed" in error_message:
+            logger.warning("Topic reopening deferred (not deleted) id=%s error=%s", topic_id, error)
+            raise
+        logger.warning("Missing Telegram topic %s; recreating", topic_id)
         await db_clear_topic(user.id, topic_id)
         return await create_topic(user, context)
 
@@ -749,8 +769,24 @@ async def get_topic(user, context, game=None, source=None, campaign_token=None) 
                 return topic_id
             return await create_topic(user, context, game, source, campaign_token)
     finally:
-        if not lock.locked():
-            _topic_locks.pop(user.id, None)
+        # Never delete this lock while other coroutines may still be waiting.
+        pass
+
+
+# Enrich original campaign-aware topic routing with CRM profile updates.
+_legacy_get_topic = get_topic
+
+
+async def get_topic(user, context, game=None, source=None, campaign_token=None):
+    topic_id = await _legacy_get_topic(user, context, game, source, campaign_token)
+    if topic_id is not None and _crm_state is not None:
+        try:
+            row = await _crm_state.db.user(user.id)
+            if row and (row.get("profile_message_id") is None or game or source or campaign_token):
+                await crm_addon.refresh_profile(_crm_state, context.bot, user.id)
+        except Exception:
+            logger.exception("CRM profile synchronization failed user=%s", user.id)
+    return topic_id
 
 
 async def group_message(user, context, topic_id: int, text: str) -> int:
@@ -1021,6 +1057,8 @@ async def finalize_bonus(user, context, bonus_key: str, bonus_label: str) -> Non
                 event_data={"bonus_key": bonus_key, "bonus_label": bonus_label},
             )
             await group_message(user, context, topic_id, f"🎁 BONUS SELECTED: {bonus_label}")
+            if _crm_state is not None:
+                await crm_addon.refresh_profile(_crm_state, context.bot, user.id)
     except Exception:
         logger.exception("Bonus finalization failed for %s", user.id)
 
@@ -1098,6 +1136,8 @@ async def finalize_game(user, context, game: str) -> None:
                 event_data={"game": game},
             )
             await group_message(user, context, topic_id, f"🎮 GAME SELECTED: {game}")
+            if _crm_state is not None:
+                await crm_addon.refresh_profile(_crm_state, context.bot, user.id)
     except Exception:
         logger.exception("Game finalization failed for %s", user.id)
 
@@ -1145,7 +1185,14 @@ async def customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             user.id, campaign_token or "none", was_nudged,
         )
 
-    await enqueue(user, update, context, topic_id)
+    if _crm_state is None:
+        await enqueue(user, update, context, topic_id)
+    else:
+        try:
+            await crm_addon.enqueue_incoming(_crm_state, user.id, "customer", update.message)
+        except Exception:
+            logger.exception("Could not persist inbound customer message user=%s", user.id)
+            await update.message.reply_text("⚠️ Your message could not be saved. Please retry.")
 
 
 # ============================================================
@@ -1480,7 +1527,7 @@ async def _campaigns_list_text() -> str:
 
 async def _staff_text() -> str:
     """Generate staff list text."""
-    ids = "\n".join(f"  {item}" for item in sorted(AUTHORIZED_STAFF)) or "  (none)"
+    ids = "\n".join(f"  {item}" for item in sorted(set(_crm_state.roles) | set(_crm_state.cfg.owner_ids) if _crm_state else AUTHORIZED_STAFF)) or "  (none)"
     return (
         f"👥 AUTHORIZED STAFF\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1825,7 +1872,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
 
     # Security: only staff can use dashboard, only in support group
-    if not query.from_user or query.from_user.id not in AUTHORIZED_STAFF:
+    if not query.from_user or not _crm_authorized(query.from_user.id):
         return
     if query.message.chat.id != SUPPORT_GROUP_ID:
         return
@@ -1950,12 +1997,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_init(application: Application) -> None:
+    await crm_addon.post_init(application)
     # Public command menu (visible to all users in private chat)
     public = [
         BotCommand("start", "Start or restart your support chat"),
         BotCommand("help", "Show help and available commands"),
         BotCommand("games", "Choose or change your game"),
         BotCommand("support", "Reach the support team"),
+        BotCommand("privacy", "Privacy policy"),
+        BotCommand("delete_data", "Delete customer records"),
+        BotCommand("optin", "Subscribe to optional updates"),
+        BotCommand("optout", "Stop optional updates"),
     ]
     await application.bot.set_my_commands(public)
 
@@ -1971,6 +2023,23 @@ async def post_init(application: Application) -> None:
         BotCommand("addstaff", "Authorize a staff member"),
         BotCommand("removestaff", "Remove a staff member"),
         BotCommand("staff", "List authorized staff"),
+        BotCommand("profile", "Pinned customer profile"),
+        BotCommand("accounts", "Saved game accounts"),
+        BotCommand("setaccount", "Save game username/password"),
+        BotCommand("delaccount", "Remove account"),
+        BotCommand("findaccount", "Search saved accounts"),
+        BotCommand("label", "Add custom label"),
+        BotCommand("unlabel", "Remove custom label"),
+        BotCommand("note", "Save staff notes"),
+        BotCommand("history", "Customer history"),
+        BotCommand("status", "Change customer status"),
+        BotCommand("assign", "Assign to staff"),
+        BotCommand("deposit", "Owner: record deposit"),
+        BotCommand("shortcuts", "Saved replies"),
+        BotCommand("use", "Send saved reply"),
+        BotCommand("health", "Delivery queue health"),
+        BotCommand("addshortcut", "Owner: add saved reply"),
+        BotCommand("delshortcut", "Owner: remove saved reply"),
     ]
     try:
         await application.bot.set_my_commands(
@@ -2006,6 +2075,7 @@ async def post_init(application: Application) -> None:
 
 
 def main() -> None:
+    global _crm_state
     print("=" * 50)
     print(f"   {BRAND.upper()} SUPPORT BOT — Ads-Optimized")
     print("=" * 50)
@@ -2019,6 +2089,12 @@ def main() -> None:
 
     init_db()
     load_staff()
+    cfg = Config()
+    cfg.validate()
+    crm_db = Database(cfg.db_url)
+    crm_db.migrate()  # Additive only; retains campaign and topic data
+    crm_db.seed(cfg.owner_ids, cfg.seed_staff)
+    _crm_state = crm_addon.State(cfg, crm_db)
 
     print(f"Support Group   : {SUPPORT_GROUP_ID}")
     print(f"Authorized Staff: {sorted(AUTHORIZED_STAFF)}")
@@ -2031,19 +2107,28 @@ def main() -> None:
         Application.builder()
         .token(TOKEN)
         .post_init(post_init)
+        .post_shutdown(crm_addon.post_shutdown)
+        .concurrent_updates(False)
         .build()
     )
+    application.bot_data["state"] = _crm_state
 
     # Customer commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("games", games))
     application.add_handler(CommandHandler("support", support))
+    for cmd, handler in (("privacy", crm_addon.privacy),
+                         ("delete_data", crm_addon.delete_data),
+                         ("optin", crm_addon.optin), ("optout", crm_addon.optout)):
+        application.add_handler(CommandHandler(cmd, handler, filters=filters.ChatType.PRIVATE))
 
     # Callback handlers (inline button clicks)
     application.add_handler(CallbackQueryHandler(bonus_selected, pattern=r"^bonus:"))
     application.add_handler(CallbackQueryHandler(game_selected, pattern=r"^game:"))
     application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
+    application.add_handler(CallbackQueryHandler(crm_addon.delete_callback, pattern=r"^delete:(yes|no):\d+$"))
+    application.add_handler(CallbackQueryHandler(crm_addon.broadcast_callback, pattern=r"^bc:(yes|no):\d+$"))
 
     # Setup helper
     application.add_handler(CommandHandler("groupid", group_id_command))
@@ -2051,22 +2136,34 @@ def main() -> None:
     # Staff commands (group-only)
     group_filter = filters.Chat(chat_id=SUPPORT_GROUP_ID)
     application.add_handler(CommandHandler("menu", menu_command, filters=group_filter))
-    application.add_handler(CommandHandler("id", customer_info, filters=group_filter))
+    application.add_handler(CommandHandler("id", crm_addon.show_profile, filters=group_filter))
+    for cmd, handler in {
+        "profile": crm_addon.show_profile, "accounts": crm_addon.show_accounts,
+        "setaccount": crm_addon.cmd_setaccount, "delaccount": crm_addon.cmd_delaccount,
+        "findaccount": crm_addon.find_account, "label": crm_addon.cmd_label,
+        "unlabel": crm_addon.cmd_unlabel, "note": crm_addon.cmd_note,
+        "history": crm_addon.show_history, "status": crm_addon.cmd_status,
+        "assign": crm_addon.cmd_assign, "deposit": crm_addon.cmd_deposit,
+        "shortcuts": crm_addon.shortcut_list, "use": crm_addon.use_shortcut,
+        "health": crm_addon.health, "addshortcut": crm_addon.addshortcut,
+        "delshortcut": crm_addon.delshortcut,
+    }.items():
+        application.add_handler(CommandHandler(cmd, handler, filters=group_filter))
     application.add_handler(CommandHandler("close", close_topic, filters=group_filter))
     application.add_handler(CommandHandler("stats", stats, filters=group_filter))
     application.add_handler(CommandHandler("adstats", adstats_command, filters=group_filter))
     application.add_handler(CommandHandler("campaigns", campaigns_command, filters=group_filter))
-    application.add_handler(CommandHandler("broadcast", broadcast, filters=group_filter))
-    application.add_handler(CommandHandler("addstaff", add_staff, filters=group_filter))
-    application.add_handler(CommandHandler("removestaff", remove_staff, filters=group_filter))
-    application.add_handler(CommandHandler("staff", staff, filters=group_filter))
+    application.add_handler(CommandHandler("broadcast", crm_addon.broadcast, filters=group_filter))
+    application.add_handler(CommandHandler("addstaff", crm_addon.addstaff, filters=group_filter))
+    application.add_handler(CommandHandler("removestaff", crm_addon.removestaff, filters=group_filter))
+    application.add_handler(CommandHandler("staff", crm_addon.staff_list, filters=group_filter))
 
     # Message handlers
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, customer_message)
     )
     application.add_handler(
-        MessageHandler(group_filter & ~filters.COMMAND, support_group_message)
+        MessageHandler(group_filter & ~filters.COMMAND, crm_addon.group_message)
     )
 
     application.add_error_handler(error_handler)
