@@ -511,11 +511,20 @@ def fire_and_forget(coroutine) -> None:
 def _crm_authorized(user_id: int) -> bool:
     if _crm_state is None:
         return user_id in AUTHORIZED_STAFF
-    return user_id in _crm_state.cfg.owner_ids or user_id in _crm_state.roles
+    return (user_id in _crm_state.cfg.owner_ids or user_id in _crm_state.cfg.seed_staff
+            or user_id in _crm_state.roles)
 
 
 def is_staff(message) -> bool:
     return bool(message.from_user and _crm_authorized(message.from_user.id))
+
+
+
+async def _ww_reject_blocked(update, context):
+    """Use CRM restrictions in the legacy campaign-aware customer handlers."""
+    if _crm_state is None:
+        return False
+    return await crm_addon._reject_blocked(update, context)
 
 
 def user_label(user) -> str:
@@ -644,6 +653,10 @@ async def schedule_nudge(user_id: int, campaign_token: str | None, context) -> N
     if not NUDGE_ENABLED:
         return
     await asyncio.sleep(NUDGE_DELAY_SECONDS)
+    if _crm_state is not None:
+        row = await _crm_state.db.user(user_id)
+        if row and row.get('is_blocked'):
+            return
     # Check if user has sent any message by now
     if user_id in _users_with_first_message:
         return
@@ -778,6 +791,10 @@ _legacy_get_topic = get_topic
 
 
 async def get_topic(user, context, game=None, source=None, campaign_token=None):
+    if _crm_state is not None:
+        row = await _crm_state.db.user(user.id)
+        if row and row.get('is_blocked'):
+            raise crm_addon.BlockedCustomer(f'Customer {user.id} is blocked')
     topic_id = await _legacy_get_topic(user, context, game, source, campaign_token)
     if topic_id is not None and _crm_state is not None:
         try:
@@ -890,6 +907,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     if not update.message or not update.effective_user:
         return
+    if await _ww_reject_blocked(update, context): return
     user = update.effective_user
     game, source_label, campaign_token = (
         parse_game(context.args or []),
@@ -1018,6 +1036,7 @@ async def bonus_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     if not query:
         return
+    if await _ww_reject_blocked(update,context): return
     await query.answer()
     user = query.from_user
     bonus_key = query.data.replace("bonus:", "", 1)
@@ -1066,6 +1085,7 @@ async def finalize_bonus(user, context, bonus_key: str, bonus_label: str) -> Non
 async def games(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
+    if await _ww_reject_blocked(update,context): return
     await update.message.reply_text("🎮 Choose your game:", reply_markup=game_keyboard())
     fire_and_forget(command_touch(update.effective_user, context, "games"))
 
@@ -1073,6 +1093,7 @@ async def games(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
+    if await _ww_reject_blocked(update,context): return
     await update.message.reply_text(
         "💬 Select your game (optional):", reply_markup=game_keyboard()
     )
@@ -1103,6 +1124,7 @@ async def game_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     query = update.callback_query
     if not query:
         return
+    if await _ww_reject_blocked(update,context): return
     await query.answer()
     user = query.from_user
     game = query.data.replace("game:", "", 1)
@@ -1146,6 +1168,7 @@ async def customer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Customer sent a message (text/photo/video/etc.) in private chat."""
     if not update.message or not update.effective_user:
         return
+    if await _ww_reject_blocked(update,context): return
     user = update.effective_user
 
     # Track first message for nudge suppression
