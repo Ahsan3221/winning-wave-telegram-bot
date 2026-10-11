@@ -84,6 +84,17 @@ class Database:
                 added_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
             cur.execute(f"ALTER TABLE {S} ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'staff'")
             cur.execute(f"ALTER TABLE {S} ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE")
+            # Legacy versions stored Telegram-added team members in public.staff.
+            # CRM now reads a brand-specific staff table. Import old members
+            # without reactivating existing revoked CRM accounts.
+            if S != 'staff':
+                cur.execute("SELECT to_regclass('staff') AS legacy_staff_table")
+                legacy = cur.fetchone()
+                if legacy and legacy['legacy_staff_table'] is not None:
+                    cur.execute(f"""INSERT INTO {S}(user_id,name,role,active)
+                        SELECT user_id,COALESCE(name,'Staff'),'staff',TRUE FROM staff
+                        ON CONFLICT (user_id) DO NOTHING""")
+
             cur.execute(f"""CREATE TABLE IF NOT EXISTS {A} (
                 id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES {U}(user_id) ON DELETE CASCADE,
                 game TEXT NOT NULL, account_username TEXT NOT NULL, changed_by BIGINT NOT NULL,
