@@ -83,11 +83,35 @@ def test_regular_unlisted_group_member_is_denied_with_useful_diagnostics():
     assert "4567" in msg.reply_text.await_args.args[0]
 
 
-def test_anonymous_admin_cannot_impersonate_a_human():
+def test_verified_anonymous_admin_can_use_group_commands():
+    # Telegram sets sender_chat to the group and from_user to the GroupAnonymousBot.
     module,update,ctx,state,msg=mocked_group(
         1087968824,sender_chat=SimpleNamespace(id=-1005555))
+    assert run(module.authorize(update,ctx))
+    assert run(module.staff_access(update,ctx)) == "admin"
+    ctx.bot.get_chat_member.assert_not_awaited()
+    msg.reply_text.assert_not_awaited()
+
+
+def test_anonymous_sender_from_other_channel_is_rejected():
+    module,update,ctx,state,msg=mocked_group(
+        1087968824,sender_chat=SimpleNamespace(id=-1006666))
     assert not run(module.authorize(update,ctx))
-    assert "Anonymous admin" in msg.reply_text.await_args.args[0]
+    assert "different channel/chat" in msg.reply_text.await_args.args[0]
+    ctx.bot.get_chat_member.assert_not_awaited()
+
+
+def test_anonymous_bot_without_matching_group_identity_is_rejected():
+    module,update,ctx,state,msg=mocked_group(1087968824)
+    assert not run(module.authorize(update,ctx))
+    ctx.bot.get_chat_member.assert_not_awaited()
+
+
+def test_callback_cannot_borrow_anonymous_group_message_identity():
+    module,update,ctx,state,msg=mocked_group(
+        1087968824,sender_chat=SimpleNamespace(id=-1005555))
+    update.callback_query = SimpleNamespace(from_user=update.effective_user)
+    assert not run(module.authorize(update,ctx))
 
 
 def test_staffcheck_is_available_to_unrecognized_staff_without_granting_access():

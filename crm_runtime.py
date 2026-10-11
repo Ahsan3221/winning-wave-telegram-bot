@@ -74,6 +74,32 @@ def owner(update, s):
     return bool(update.effective_user and update.effective_user.id in s.cfg.owner_ids)
 
 
+# Telegram supplies this pseudo-user for messages posted by anonymous
+# administrators on behalf of their own group. The real human ID is hidden.
+_ANONYMOUS_ADMIN_USER_ID = 1087968824
+
+
+def verified_anonymous_group_admin(update, s):
+    """Accept only Telegram's own support-group sender identity for group posts.
+
+    A linked channel or a forwarded post is never equivalent to a support-group
+    administrator. Callback queries are intentionally excluded: callbacks carry
+    the clicking human's identity, not the original message's sender identity.
+    """
+    if getattr(update, 'callback_query', None) is not None:
+        return False
+    msg = getattr(update, 'message', None)
+    actor = getattr(update, 'effective_user', None)
+    sender = getattr(msg, 'sender_chat', None)
+    chat = getattr(update, 'effective_chat', None)
+    if not msg or sender is None or actor is None or chat is None:
+        return False
+    return (int(chat.id) == int(s.cfg.group_id)
+            and int(sender.id) == int(s.cfg.group_id)
+            and int(actor.id) == _ANONYMOUS_ADMIN_USER_ID
+            and not bool(getattr(msg, 'is_automatic_forward', False)))
+
+
 def staff_role(update, s):
     """Resolve saved and Railway staff independently of optional role labels."""
     uid = update.effective_user.id if update.effective_user else None
@@ -94,6 +120,14 @@ async def staff_access(update, context):
     """One canonical access check for commands, callbacks and forum replies."""
     s = state(context)
     if not update.effective_user or not in_group(update, s):
+        return None
+    # A Telegram-authenticated message sent as the configured group can only
+    # originate from a group administrator. Its personal ID is not available.
+    if verified_anonymous_group_admin(update, s):
+        return 'admin'
+    # Never assign owner/staff rights to the shared anonymous-bot pseudo-user
+    # unless Telegram authenticated the group sender above.
+    if update.effective_user.id == _ANONYMOUS_ADMIN_USER_ID:
         return None
     role = staff_role(update, s)
     if role:
@@ -126,10 +160,12 @@ async def authorize(update, context, owner_only=False):
     role = await staff_access(update, context)
     if not role:
         uid = update.effective_user.id if update.effective_user else 'unknown'
-        if getattr(message, 'sender_chat', None):
+        sender_chat = getattr(message, 'sender_chat', None)
+        if sender_chat is not None:
             await message.reply_text(
-                '⛔ Anonymous admin mode hides your personal Telegram ID. '
-                'Post as your own account, then retry /staffcheck.')
+                '⛔ This message was sent as a different channel/chat, '
+                'not as the configured support group. Choose your own Telegram '
+                'account or Send as this support group, then retry /staffcheck.')
         else:
             await message.reply_text(
                 f'⛔ Staff access not found for Telegram ID {uid}. '
@@ -153,7 +189,8 @@ async def staffcheck(update, context):
     role = await staff_access(update, context)
     sources = getattr(s.cfg, 'staff_id_sources', {}).get(uid, ())
     in_db = s.roles.get(uid) if uid is not None else None
-    anonymous = bool(getattr(msg, 'sender_chat', None))
+    anonymous = verified_anonymous_group_admin(update, s)
+    channel_sender = getattr(msg, 'sender_chat', None)
     await msg.reply_text(
         f'🔎 STAFF ACCESS CHECK\n'
         f'👤 Telegram ID: {uid or "unknown"}\n'
@@ -161,8 +198,12 @@ async def staffcheck(update, context):
         f'🗄️ Active DB role: {in_db or "not found"}\n'
         f'⚙️ Railway ID variable(s): {", ".join(sorted(sources)) or "not found"}\n'
         f'🛡️ Effective permission: {role or "NOT AUTHORIZED"}\n'
-        + ('⚠️ You are posting anonymously. Turn anonymous admin off.\n'
+        + ('ℹ️ Verified anonymous support-group administrator: '
+           'personal identity is hidden; actions are recorded as this group.\n'
            if anonymous else '')
+        + ('⚠️ This message was sent as another chat/channel. '
+           'It is not proof of support-group admin access.\n'
+           if channel_sender is not None and not anonymous else '')
         + ('Ask a staff admin to use /addstaff with this Telegram ID, '
            'or add it to a Railway staff ID variable and redeploy.'
            if not role else '✅ Broadcast and CRM commands are enabled.'))
@@ -579,7 +620,11 @@ async def customer_message(update,context):
 async def group_message(update,context):
     s=state(context)
     msg=update.message
-    if not msg or not in_group(update,s) or not msg.from_user or msg.from_user.is_bot:
+    if not msg or not in_group(update,s) or not msg.from_user:
+        return
+    # Telegram's GroupAnonymousBot is marked is_bot=True. Allow this trusted
+    # pseudo-user only when sender_chat confirms the configured support group.
+    if msg.from_user.is_bot and not verified_anonymous_group_admin(update,s):
         return
     if not await staff_access(update,context):
         log.warning('Ignored unauthorized group message from id=%s',msg.from_user.id)
