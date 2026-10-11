@@ -1278,13 +1278,9 @@ async def support_group_message(update: Update, context: ContextTypes.DEFAULT_TY
 # STAFF COMMAND — Authorization helper
 # ============================================================
 
-async def require_staff(update: Update) -> bool:
-    if not update.message or update.message.chat.id != SUPPORT_GROUP_ID:
-        return False
-    if not is_staff(update.message):
-        await update.message.reply_text("⛔ You are not authorized to use this command.")
-        return False
-    return True
+async def require_staff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Share the same DB/env/Telegram administrator check as the CRM."""
+    return await crm_addon.authorize(update, context)
 
 
 # ============================================================
@@ -1310,7 +1306,7 @@ async def group_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # ============================================================
 
 async def customer_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
+    if not await require_staff(update, context):
         return
     topic_id = update.message.message_thread_id
     if not topic_id or topic_id == 1:
@@ -1346,7 +1342,7 @@ async def customer_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ============================================================
 
 async def close_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
+    if not await require_staff(update, context):
         return
     topic_id = update.message.message_thread_id
     if not topic_id or topic_id == 1:
@@ -1568,7 +1564,7 @@ async def _staff_text() -> str:
 # ============================================================
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
+    if not await require_staff(update, context):
         return
     text = await _stats_text()
     await update.message.reply_text(text)
@@ -1579,7 +1575,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ============================================================
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
+    if not await require_staff(update, context):
         return
     text = " ".join(context.args or []).strip()
     if not text:
@@ -1629,7 +1625,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ============================================================
 
 async def add_staff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
+    if not await require_staff(update, context):
         return
     args = context.args or []
     if not args or not args[0].lstrip("-").isdigit():
@@ -1642,7 +1638,7 @@ async def add_staff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def remove_staff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
+    if not await require_staff(update, context):
         return
     args = context.args or []
     if not args or not args[0].lstrip("-").isdigit():
@@ -1655,7 +1651,7 @@ async def remove_staff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def staff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_staff(update):
+    if not await require_staff(update, context):
         return
     text = await _staff_text()
     await update.message.reply_text(text)
@@ -1674,7 +1670,7 @@ async def campaigns_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
       /campaigns end <token>              — mark campaign ended
       /campaigns clicks <token> <count>   — update actual_clicks from Telegram Ads dashboard
     """
-    if not await require_staff(update):
+    if not await require_staff(update, context):
         return
 
     args = context.args or []
@@ -1753,7 +1749,7 @@ async def adstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
       /adstats                  — overview of all campaigns
       /adstats <token>          — detailed breakdown of one campaign
     """
-    if not await require_staff(update):
+    if not await require_staff(update, context):
         return
 
     args = context.args or []
@@ -1886,7 +1882,7 @@ def campaigns_menu_keyboard() -> InlineKeyboardMarkup:
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Open the staff dashboard with buttons."""
-    if not await require_staff(update):
+    if not await require_staff(update, context):
         return
     await update.message.reply_text(dashboard_text(), reply_markup=dashboard_keyboard())
 
@@ -1899,7 +1895,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
 
     # Security: only staff can use dashboard, only in support group
-    if not query.from_user or not _crm_authorized(query.from_user.id):
+    if not query.from_user or not await crm_addon.staff_access(update,context):
         return
     if query.message.chat.id != SUPPORT_GROUP_ID:
         return
