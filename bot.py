@@ -957,6 +957,7 @@ async def finalize_start(
     try:
         # Log event FIRST (even if topic creation fails, we keep attribution)
         old = await db_user(user.id)
+        was_known_to_crm = await _crm_state.db.user(user.id) if _crm_state else None
         is_new_user = not (old and old.get("topic_id"))
 
         await db_log_event(
@@ -987,6 +988,9 @@ async def finalize_start(
         topic_id = await get_topic(
             user, context, game=game, source=source, campaign_token=campaign_token,
         )
+        # First-time /start is enough; protect historic explicit opt-outs.
+        if topic_id and _crm_state is not None and was_known_to_crm is None:
+            await _crm_state.db.opt_in(user.id, True)
 
         if topic_id and not is_new_user:
             # Returning customer: notify staff (don't re-post full card)
@@ -2029,8 +2033,6 @@ async def post_init(application: Application) -> None:
         BotCommand("support", "Reach the support team"),
         BotCommand("privacy", "Privacy policy"),
         BotCommand("delete_data", "Delete customer records"),
-        BotCommand("optin", "Subscribe to optional updates"),
-        BotCommand("optout", "Stop optional updates"),
     ]
     await application.bot.set_my_commands(public)
 
@@ -2143,7 +2145,7 @@ def main() -> None:
     application.add_handler(CommandHandler("support", support))
     for cmd, handler in (("privacy", crm_addon.privacy),
                          ("delete_data", crm_addon.delete_data),
-                         ("optin", crm_addon.optin), ("optout", crm_addon.optout)):
+                         ("optout", crm_addon.optout)):
         application.add_handler(CommandHandler(cmd, handler, filters=filters.ChatType.PRIVATE))
 
     # Callback handlers (inline button clicks)
