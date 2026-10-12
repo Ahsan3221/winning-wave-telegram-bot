@@ -596,7 +596,8 @@ class Database:
             customers=cur.fetchall()
             for user in customers:
                 first=(user['name'] or 'there').split(' ')[0]
-                content=f"📢 Ace Arcade UPDATE\n\n{row['body'].replace('{name}', first)}"
+                # Send only what staff typed; personalize first name.
+                content=row['body'].replace('{name}', first)
                 cur.execute(f"""INSERT INTO {O}(user_id,direction,body,idempotency_key)
                     VALUES(%s,'broadcast',%s,%s) ON CONFLICT (idempotency_key) DO NOTHING""",
                     (user['user_id'],content,f"broadcast:{bid}:{user['user_id']}"))

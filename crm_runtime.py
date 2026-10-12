@@ -355,6 +355,23 @@ async def recover_after_delivery(s,bot,uid):
             raise
 
 
+# Old Winning Wave CRM accidentally used the Ace Arcade header.
+# Clean queued legacy deliveries without changing the author's message.
+_OLD_BROADCAST_HEADERS = (
+    '📢 Ace Arcade UPDATE\n\n',
+    '📢 Winning Wave UPDATE\n\n',
+)
+
+
+def clean_broadcast_body(body):
+    """Strip a generated legacy header from queued broadcasts only."""
+    content=body or ''
+    for header in _OLD_BROADCAST_HEADERS:
+        if content.startswith(header):
+            return content[len(header):]
+    return content
+
+
 async def deliver_job(application, s, job):
     bot=application.bot
     uid=int(job['user_id'])
@@ -389,7 +406,8 @@ async def deliver_job(application, s, job):
         await bot.copy_message(chat_id=uid,from_chat_id=int(job['source_chat_id']),
                                message_id=int(job['source_message_id']))
     else:
-        await bot.send_message(chat_id=uid,text=job['body'])
+        text=clean_broadcast_body(job['body']) if direction=='broadcast' else job['body']
+        await bot.send_message(chat_id=uid,text=text)
     return True
 
 
@@ -412,7 +430,7 @@ async def mirror_one_broadcast(application,s):
     try:
         await application.bot.send_message(
             chat_id=s.cfg.group_id, message_thread_id=int(job['topic_id']),
-            text=('📢 BROADCAST SENT\n\n'+(job.get('body') or ''))[:4000])
+            text=('📢 BROADCAST SENT\n\n'+clean_broadcast_body(job.get('body')))[:4000])
     except RetryAfter as exc:
         await s.db.outbox_mirror_result(job_id,False,str(exc),max(1,int(exc.retry_after)+1))
     except Exception as exc:
